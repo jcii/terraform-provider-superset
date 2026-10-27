@@ -265,11 +265,14 @@ func TestDatasetUpdate_RefreshFailure_RetriedOnNextApply(t *testing.T) {
 		t.Fatal("refresh failure did not mark the refresh pending in private state")
 	}
 
-	// Refresh before apply 2: Superset reports the new SQL, but Read keeps
-	// the prior SQL while the refresh is pending, so the plan still diffs.
+	// Refresh before apply 2: Superset reports the new SQL; while the refresh
+	// is pending Read stores a value that differs from every config (the new
+	// SQL, the reverted old SQL, or none), so the plan still diffs.
 	readSQL := datasetSQLFromRead(prior.SQL, newSQL.ValueString(), columnsRefreshPending(ctx, private))
-	if !readSQL.Equal(oldSQL) {
-		t.Fatalf("Read stored sql %q while refresh pending, want prior %q", readSQL.ValueString(), oldSQL.ValueString())
+	for _, cfg := range []types.String{newSQL, oldSQL, types.StringNull()} {
+		if readSQL.Equal(cfg) {
+			t.Fatalf("Read stored sql %q while refresh pending; equals config %v, so no diff and no retry", readSQL.ValueString(), cfg)
+		}
 	}
 
 	// Apply 2: refresh now succeeds and clears the marker.
@@ -316,9 +319,10 @@ func TestDatasetSQLFromRead(t *testing.T) {
 		pending bool
 		want    types.String
 	}{
-		"remote sql wins":         {"SELECT 2", false, types.StringValue("SELECT 2")},
-		"pending keeps prior":     {"SELECT 2", true, prior},
-		"remote null keeps prior": {nil, false, prior},
+		"remote sql wins":            {"SELECT 2", false, types.StringValue("SELECT 2")},
+		"pending marks remote sql":   {"SELECT 2", true, types.StringValue("SELECT 2" + datasetRefreshPendingSQLSuffix)},
+		"remote null keeps prior":    {nil, false, prior},
+		"pending, remote null marks": {nil, true, types.StringValue("SELECT 1" + datasetRefreshPendingSQLSuffix)},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

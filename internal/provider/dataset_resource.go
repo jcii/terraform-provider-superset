@@ -242,10 +242,11 @@ func (r *datasetResource) Update(ctx context.Context, req resource.UpdateRequest
 }
 
 // datasetColumnsRefreshPendingKey marks, in the resource's private state, a
-// dataset whose SQL was PUT but whose column refresh then failed. While it is
-// set, Read keeps the prior-state SQL instead of Superset's (already new) SQL,
-// so the next plan still shows the SQL diff and the next apply retries; and
-// Update refreshes even if the SQL did not change in that plan.
+// dataset whose SQL was PUT but whose column refresh then failed. Superset
+// already holds the new SQL, so a plain Read would leave no diff and the
+// refresh would never be retried. While it is set, Read marks the stored sql
+// (datasetRefreshPendingSQLSuffix) so the next plan always diffs, and Update
+// refreshes even if the SQL did not change in that plan.
 const datasetColumnsRefreshPendingKey = "columns_refresh_pending"
 
 // privateKeyStore is the subset of the framework's private-state API used
@@ -299,8 +300,8 @@ func (r *datasetResource) updateDataset(ctx context.Context, plan, state dataset
 
 	if err := r.client.RefreshDataset(id); err != nil {
 		// The PUT already landed, so Superset holds the new SQL and a plain
-		// Read would hide the diff. Mark the refresh pending (Read then keeps
-		// the prior SQL) and leave the prior state, so the next apply retries.
+		// Read would hide the diff. Mark the refresh pending so Read forces a
+		// diff and the next apply retries; the prior state is left in place.
 		if private != nil {
 			diags.Append(private.SetKey(ctx, datasetColumnsRefreshPendingKey, []byte("true"))...)
 		}
@@ -323,17 +324,24 @@ func (r *datasetResource) updateDataset(ctx context.Context, plan, state dataset
 	return !diags.HasError()
 }
 
-// datasetSQLFromRead is the sql value Read stores: Superset's SQL, except
-// while a column refresh is pending, when the prior state's SQL is kept so
-// the next plan still diffs and the next apply retries the refresh.
+// datasetRefreshPendingSQLSuffix is appended to the sql Read stores while a
+// column refresh is pending. No configuration contains it, so whatever the
+// config's sql is (the SQL that was PUT, a reverted one, or none), the next
+// plan shows an sql diff and the next apply runs Update, which re-PUTs the
+// configured SQL and retries the refresh. The plan diff names the reason.
+const datasetRefreshPendingSQLSuffix = "\n-- terraform-provider-superset: column refresh pending; the next apply re-applies this dataset and retries it"
+
+// datasetSQLFromRead is the sql value Read stores: Superset's SQL (so
+// out-of-band drift still shows), suffixed while a column refresh is pending.
 func datasetSQLFromRead(prior types.String, remote interface{}, refreshPending bool) types.String {
+	sql := prior
+	if s, ok := remote.(string); ok {
+		sql = types.StringValue(s)
+	}
 	if refreshPending {
-		return prior
+		return types.StringValue(sql.ValueString() + datasetRefreshPendingSQLSuffix)
 	}
-	if sql, ok := remote.(string); ok {
-		return types.StringValue(sql)
-	}
-	return prior
+	return sql
 }
 
 // Delete deletes the resource and removes the Terraform state on success.
