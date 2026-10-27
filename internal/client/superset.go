@@ -1196,6 +1196,37 @@ func (c *Client) UpdateDataset(id int64, tableName, schema, sql string) error {
 	return nil
 }
 
+// RefreshDataset re-syncs a dataset's column list from its source via
+// PUT /api/v1/dataset/<id>/refresh (the API behind the UI's "Sync columns from
+// source"). Superset derives a virtual dataset's columns only on create, so a
+// column added to the SQL by a later update stays unknown to Superset (charts
+// requesting it fail with "Columns missing in dataset") until this is called.
+func (c *Client) RefreshDataset(id int64) error {
+	csrfToken, cookies, err := c.GetCSRFToken()
+	if err != nil {
+		return err
+	}
+
+	headers := map[string]string{
+		"X-CSRFToken": csrfToken,
+		"Referer":     c.Host,
+	}
+
+	endpoint := fmt.Sprintf("/api/v1/dataset/%d/refresh", id)
+	resp, err := c.DoRequestWithHeadersAndCookies("PUT", endpoint, nil, headers, cookies)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to refresh dataset columns, status code: %d, response: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
 // DeleteDataset deletes a dataset by ID.
 func (c *Client) DeleteDataset(id int64) error {
 	csrfToken, cookies, err := c.GetCSRFToken()
