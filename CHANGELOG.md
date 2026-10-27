@@ -4,6 +4,9 @@ FEATURES:
 * **New Resource**: `superset_user` - Manage Superset users
 * **New Data Source**: `superset_users` - Fetch users from Superset
 
+IMPROVEMENTS:
+* `superset_dataset`: when `sql` changes on update, the provider now calls `PUT /api/v1/dataset/{id}/refresh` after the update so Superset re-syncs the dataset's columns from source. A column added to a virtual dataset's SQL is usable by charts in the same apply, instead of failing with "Columns missing in dataset" until a manual "Sync columns from source". A refresh failure is reported as an error and leaves the prior state, so the next apply retries.
+
 ## 0.2.0 (2025-08-29)
 
 FEATURES:

@@ -71,7 +71,7 @@ func (r *datasetResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Optional:    true,
 			},
 			"sql": schema.StringAttribute{
-				Description: "SQL query for the dataset (optional, for SQL-based datasets).",
+				Description: "SQL query for the dataset (optional, for SQL-based datasets). When this changes on update, the provider re-syncs the dataset's columns from source (PUT /api/v1/dataset/{id}/refresh) so columns added by the new SQL are usable by charts in the same apply.",
 				Optional:    true,
 			},
 		},
@@ -214,6 +214,14 @@ func (r *datasetResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 
+	// Prior state, to tell whether the SQL changed in this plan.
+	var state datasetResourceModel
+	diags = req.State.Get(ctx, &state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// Update dataset (database cannot be changed, so we don't validate it)
 	err := r.client.UpdateDataset(
 		plan.ID.ValueInt64(),
@@ -232,6 +240,28 @@ func (r *datasetResource) Update(ctx context.Context, req resource.UpdateRequest
 	tflog.Debug(ctx, "Updated dataset", map[string]interface{}{
 		"id": plan.ID.ValueInt64(),
 	})
+
+	// Superset derives a dataset's column list only on create; a column added
+	// to the SQL stays unknown (and charts requesting it fail with "Columns
+	// missing in dataset") until the columns are re-synced from source. Do it
+	// here, only when the SQL actually changed, so one apply ships the new
+	// columns before dependent charts are applied.
+	if !plan.SQL.Equal(state.SQL) {
+		if err := r.client.RefreshDataset(plan.ID.ValueInt64()); err != nil {
+			// Leave the prior state in place: the next plan still shows the
+			// SQL diff, so the next apply re-PUTs and retries the refresh.
+			resp.Diagnostics.AddError(
+				"Error refreshing dataset columns",
+				"Dataset ID "+fmt.Sprintf("%d", plan.ID.ValueInt64())+" was updated with the new SQL, but "+
+					"re-syncing its columns from source failed, so columns added by the SQL change are "+
+					"not yet known to Superset: "+err.Error(),
+			)
+			return
+		}
+		tflog.Debug(ctx, "Refreshed dataset columns after SQL change", map[string]interface{}{
+			"id": plan.ID.ValueInt64(),
+		})
+	}
 
 	// Set updated state
 	diags = resp.State.Set(ctx, plan)

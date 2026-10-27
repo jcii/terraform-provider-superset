@@ -73,7 +73,7 @@ resource "superset_dataset" "example" {
 ### Optional
 
 - `schema` (String) Database schema name (optional).
-- `sql` (String) SQL query for the dataset (optional, for SQL-based datasets).
+- `sql` (String) SQL query for the dataset (optional, for SQL-based datasets). When this changes on update, the provider re-syncs the dataset's columns from source (PUT /api/v1/dataset/{id}/refresh) so columns added by the new SQL are usable by charts in the same apply.
 
 ### Read-Only
 
