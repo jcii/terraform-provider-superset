@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -275,7 +276,7 @@ func (r *datasetResource) updateDataset(ctx context.Context, plan, state dataset
 		id,
 		plan.TableName.ValueString(),
 		plan.Schema.ValueString(),
-		plan.SQL.ValueString(),
+		stripRefreshPendingSuffix(plan.SQL.ValueString()),
 	)
 	if err != nil {
 		diags.AddError(
@@ -339,9 +340,18 @@ func datasetSQLFromRead(prior types.String, remote interface{}, refreshPending b
 		sql = types.StringValue(s)
 	}
 	if refreshPending {
-		return types.StringValue(sql.ValueString() + datasetRefreshPendingSQLSuffix)
+		// Trim first: the prior-state fallback may already carry the suffix.
+		return types.StringValue(stripRefreshPendingSuffix(sql.ValueString()) + datasetRefreshPendingSQLSuffix)
 	}
 	return sql
+}
+
+// stripRefreshPendingSuffix removes the pending marker. The marker lives only
+// in Terraform state and must never reach Superset; it can show up in a plan
+// when the config uses ignore_changes = [sql], because the planned sql is then
+// the prior state's (suffixed) value.
+func stripRefreshPendingSuffix(sql string) string {
+	return strings.TrimSuffix(sql, datasetRefreshPendingSQLSuffix)
 }
 
 // Delete deletes the resource and removes the Terraform state on success.

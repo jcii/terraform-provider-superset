@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,6 +26,7 @@ type fakeSuperset struct {
 	refreshCSRF   string   // X-CSRFToken seen on the refresh call
 	refreshCookie string   // session cookie seen on the refresh call
 	refreshStatus int
+	putSQL        []string // sql field of each dataset PUT body
 }
 
 func (f *fakeSuperset) handler(w http.ResponseWriter, r *http.Request) {
@@ -37,6 +39,11 @@ func (f *fakeSuperset) handler(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "session", Value: "sess-123"})
 		_, _ = w.Write([]byte(`{"result":"csrf-abc"}`))
 	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/dataset/42":
+		var body struct {
+			SQL string `json:"sql"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.putSQL = append(f.putSQL, body.SQL)
 		_, _ = w.Write([]byte(`{}`))
 	case r.Method == http.MethodPut && r.URL.Path == "/api/v1/dataset/42/refresh":
 		f.refreshCSRF = r.Header.Get("X-CSRFToken")
@@ -323,6 +330,8 @@ func TestDatasetSQLFromRead(t *testing.T) {
 		"pending marks remote sql":   {"SELECT 2", true, types.StringValue("SELECT 2" + datasetRefreshPendingSQLSuffix)},
 		"remote null keeps prior":    {nil, false, prior},
 		"pending, remote null marks": {nil, true, types.StringValue("SELECT 1" + datasetRefreshPendingSQLSuffix)},
+		"pending, marked remote does not stack": {"SELECT 2" + datasetRefreshPendingSQLSuffix, true,
+			types.StringValue("SELECT 2" + datasetRefreshPendingSQLSuffix)},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -330,5 +339,27 @@ func TestDatasetSQLFromRead(t *testing.T) {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// With ignore_changes = [sql], the planned sql is the prior state's value,
+// which carries the pending marker while a refresh is pending. The marker
+// must never be PUT to Superset.
+func TestDatasetUpdate_PendingMarkerNeverSentToSuperset(t *testing.T) {
+	ctx := context.Background()
+	clean := "SELECT id, birth_date FROM laborers"
+	marked := types.StringValue(clean + datasetRefreshPendingSQLSuffix)
+	private := memPrivate{datasetColumnsRefreshPendingKey: []byte("true")}
+
+	fake, r := newFakeDatasetResource(t, http.StatusOK)
+	var diags diag.Diagnostics
+	if !r.updateDataset(ctx, datasetModel("roster_v2", "reporting", marked), datasetModel("roster", "reporting", marked), private, &diags) {
+		t.Fatalf("update failed: %v", diags)
+	}
+	if len(fake.putSQL) != 1 || fake.putSQL[0] != clean {
+		t.Fatalf("PUT sql = %q, want the SQL without the pending marker", fake.putSQL)
+	}
+	if got := fake.count("PUT", "/api/v1/dataset/42/refresh"); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1 for a pending refresh", got)
 	}
 }
