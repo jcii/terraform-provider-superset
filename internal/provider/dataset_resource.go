@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -177,9 +178,11 @@ func (r *datasetResource) Read(ctx context.Context, req resource.ReadRequest, re
 		state.Schema = types.StringValue(schema)
 	}
 
-	if sql, ok := (*dataset)["sql"].(string); ok {
-		state.SQL = types.StringValue(sql)
+	var private privateKeyStore
+	if req.Private != nil {
+		private = req.Private
 	}
+	state.SQL = datasetSQLFromRead(state.SQL, (*dataset)["sql"], columnsRefreshPending(ctx, private))
 
 	// Get database name by ID
 	if database, ok := (*dataset)["database"].(map[string]interface{}); ok {
@@ -222,45 +225,12 @@ func (r *datasetResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 
-	// Update dataset (database cannot be changed, so we don't validate it)
-	err := r.client.UpdateDataset(
-		plan.ID.ValueInt64(),
-		plan.TableName.ValueString(),
-		plan.Schema.ValueString(),
-		plan.SQL.ValueString(),
-	)
-	if err != nil {
-		resp.Diagnostics.AddError(
-			"Error updating dataset",
-			"Could not update dataset ID "+fmt.Sprintf("%d", plan.ID.ValueInt64())+": "+err.Error(),
-		)
-		return
+	var private privateKeyStore
+	if resp.Private != nil {
+		private = resp.Private
 	}
-
-	tflog.Debug(ctx, "Updated dataset", map[string]interface{}{
-		"id": plan.ID.ValueInt64(),
-	})
-
-	// Superset derives a dataset's column list only on create; a column added
-	// to the SQL stays unknown (and charts requesting it fail with "Columns
-	// missing in dataset") until the columns are re-synced from source. Do it
-	// here, only when the SQL actually changed, so one apply ships the new
-	// columns before dependent charts are applied.
-	if !plan.SQL.Equal(state.SQL) {
-		if err := r.client.RefreshDataset(plan.ID.ValueInt64()); err != nil {
-			// Leave the prior state in place: the next plan still shows the
-			// SQL diff, so the next apply re-PUTs and retries the refresh.
-			resp.Diagnostics.AddError(
-				"Error refreshing dataset columns",
-				"Dataset ID "+fmt.Sprintf("%d", plan.ID.ValueInt64())+" was updated with the new SQL, but "+
-					"re-syncing its columns from source failed, so columns added by the SQL change are "+
-					"not yet known to Superset: "+err.Error(),
-			)
-			return
-		}
-		tflog.Debug(ctx, "Refreshed dataset columns after SQL change", map[string]interface{}{
-			"id": plan.ID.ValueInt64(),
-		})
+	if !r.updateDataset(ctx, plan, state, private, &resp.Diagnostics) {
+		return
 	}
 
 	// Set updated state
@@ -269,6 +239,101 @@ func (r *datasetResource) Update(ctx context.Context, req resource.UpdateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
+}
+
+// datasetColumnsRefreshPendingKey marks, in the resource's private state, a
+// dataset whose SQL was PUT but whose column refresh then failed. While it is
+// set, Read keeps the prior-state SQL instead of Superset's (already new) SQL,
+// so the next plan still shows the SQL diff and the next apply retries; and
+// Update refreshes even if the SQL did not change in that plan.
+const datasetColumnsRefreshPendingKey = "columns_refresh_pending"
+
+// privateKeyStore is the subset of the framework's private-state API used
+// here, so the update logic can be tested with an in-memory store.
+type privateKeyStore interface {
+	GetKey(ctx context.Context, key string) ([]byte, diag.Diagnostics)
+	SetKey(ctx context.Context, key string, value []byte) diag.Diagnostics
+}
+
+func columnsRefreshPending(ctx context.Context, private privateKeyStore) bool {
+	if private == nil {
+		return false
+	}
+	v, _ := private.GetKey(ctx, datasetColumnsRefreshPendingKey)
+	return len(v) > 0
+}
+
+// updateDataset PUTs the planned dataset and, when the SQL changed (or an
+// earlier column refresh is still pending), re-syncs its columns from source.
+// It returns false when it added an error diagnostic.
+func (r *datasetResource) updateDataset(ctx context.Context, plan, state datasetResourceModel, private privateKeyStore, diags *diag.Diagnostics) bool {
+	id := plan.ID.ValueInt64()
+
+	// Update dataset (database cannot be changed, so we don't validate it)
+	err := r.client.UpdateDataset(
+		id,
+		plan.TableName.ValueString(),
+		plan.Schema.ValueString(),
+		plan.SQL.ValueString(),
+	)
+	if err != nil {
+		diags.AddError(
+			"Error updating dataset",
+			"Could not update dataset ID "+fmt.Sprintf("%d", id)+": "+err.Error(),
+		)
+		return false
+	}
+
+	tflog.Debug(ctx, "Updated dataset", map[string]interface{}{
+		"id": id,
+	})
+
+	// Superset derives a dataset's column list only on create; a column added
+	// to the SQL stays unknown (and charts requesting it fail with "Columns
+	// missing in dataset") until the columns are re-synced from source. Do it
+	// here, only when the SQL changed or a previous refresh failed, so one
+	// apply ships the new columns before dependent charts are applied.
+	if plan.SQL.Equal(state.SQL) && !columnsRefreshPending(ctx, private) {
+		return true
+	}
+
+	if err := r.client.RefreshDataset(id); err != nil {
+		// The PUT already landed, so Superset holds the new SQL and a plain
+		// Read would hide the diff. Mark the refresh pending (Read then keeps
+		// the prior SQL) and leave the prior state, so the next apply retries.
+		if private != nil {
+			diags.Append(private.SetKey(ctx, datasetColumnsRefreshPendingKey, []byte("true"))...)
+		}
+		diags.AddError(
+			"Error refreshing dataset columns",
+			"Dataset ID "+fmt.Sprintf("%d", id)+" was updated with the new SQL, but re-syncing its "+
+				"columns from source failed, so columns added by the SQL change are not yet known to "+
+				"Superset and charts using them will fail. The next apply retries the refresh; to fix "+
+				"it sooner, use \"Sync columns from source\" on the dataset in Superset. Cause: "+err.Error(),
+		)
+		return false
+	}
+
+	if private != nil {
+		diags.Append(private.SetKey(ctx, datasetColumnsRefreshPendingKey, nil)...)
+	}
+	tflog.Debug(ctx, "Refreshed dataset columns from source", map[string]interface{}{
+		"id": id,
+	})
+	return !diags.HasError()
+}
+
+// datasetSQLFromRead is the sql value Read stores: Superset's SQL, except
+// while a column refresh is pending, when the prior state's SQL is kept so
+// the next plan still diffs and the next apply retries the refresh.
+func datasetSQLFromRead(prior types.String, remote interface{}, refreshPending bool) types.String {
+	if refreshPending {
+		return prior
+	}
+	if sql, ok := remote.(string); ok {
+		return types.StringValue(sql)
+	}
+	return prior
 }
 
 // Delete deletes the resource and removes the Terraform state on success.

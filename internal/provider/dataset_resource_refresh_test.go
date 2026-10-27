@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -67,15 +68,35 @@ func (f *fakeSuperset) count(method, path string) int {
 
 // runDatasetUpdate drives datasetResource.Update directly from prior and
 // planned models against a fake Superset, the same way the framework calls it.
+func newFakeDatasetResource(t *testing.T, refreshStatus int) (*fakeSuperset, *datasetResource) {
+	t.Helper()
+	fake := &fakeSuperset{refreshStatus: refreshStatus}
+	server := httptest.NewServer(http.HandlerFunc(fake.handler))
+	t.Cleanup(server.Close)
+	return fake, &datasetResource{client: &client.Client{Host: server.URL, Token: "fake-token"}}
+}
+
+// memPrivate is an in-memory stand-in for the framework's private state.
+type memPrivate map[string][]byte
+
+func (m memPrivate) GetKey(_ context.Context, key string) ([]byte, diag.Diagnostics) {
+	return m[key], nil
+}
+
+func (m memPrivate) SetKey(_ context.Context, key string, value []byte) diag.Diagnostics {
+	if len(value) == 0 {
+		delete(m, key)
+	} else {
+		m[key] = value
+	}
+	return nil
+}
+
 func runDatasetUpdate(t *testing.T, refreshStatus int, prior, planned datasetResourceModel) (*fakeSuperset, *resource.UpdateResponse) {
 	t.Helper()
 	ctx := context.Background()
 
-	fake := &fakeSuperset{refreshStatus: refreshStatus}
-	server := httptest.NewServer(http.HandlerFunc(fake.handler))
-	t.Cleanup(server.Close)
-
-	r := &datasetResource{client: &client.Client{Host: server.URL, Token: "fake-token"}}
+	fake, r := newFakeDatasetResource(t, refreshStatus)
 
 	var schemaResp resource.SchemaResponse
 	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
@@ -214,11 +235,96 @@ func TestDatasetUpdate_RefreshFailure_IsErrorAndKeepsPriorState(t *testing.T) {
 		t.Fatalf("refresh error diagnostic missing or lacks the status: %v", resp.Diagnostics)
 	}
 
-	// Prior state is kept so the next plan still shows the SQL diff and the
-	// next apply retries the PUT + refresh.
+	// The returned state is the prior one (no new state recorded on error).
 	var got datasetResourceModel
 	resp.State.Get(context.Background(), &got)
 	if got.SQL.ValueString() != prior.SQL.ValueString() {
 		t.Errorf("state sql = %q, want prior sql %q", got.SQL.ValueString(), prior.SQL.ValueString())
+	}
+}
+
+// A failed refresh must actually be retried on the next apply. The PUT has
+// already stored the new SQL in Superset, so without the pending marker the
+// next Read would copy the new SQL into state, the plan would be empty, and
+// the refresh would never run again.
+func TestDatasetUpdate_RefreshFailure_RetriedOnNextApply(t *testing.T) {
+	ctx := context.Background()
+	oldSQL := types.StringValue("SELECT id FROM laborers")
+	newSQL := types.StringValue("SELECT id, birth_date FROM laborers")
+	prior := datasetModel("roster", "reporting", oldSQL)
+	planned := datasetModel("roster", "reporting", newSQL)
+	private := memPrivate{}
+
+	// Apply 1: PUT succeeds, refresh fails.
+	fake, r := newFakeDatasetResource(t, http.StatusInternalServerError)
+	var diags diag.Diagnostics
+	if r.updateDataset(ctx, planned, prior, private, &diags) || !diags.HasError() {
+		t.Fatalf("expected a failed update, diags: %v", diags)
+	}
+	if !columnsRefreshPending(ctx, private) {
+		t.Fatal("refresh failure did not mark the refresh pending in private state")
+	}
+
+	// Refresh before apply 2: Superset reports the new SQL, but Read keeps
+	// the prior SQL while the refresh is pending, so the plan still diffs.
+	readSQL := datasetSQLFromRead(prior.SQL, newSQL.ValueString(), columnsRefreshPending(ctx, private))
+	if !readSQL.Equal(oldSQL) {
+		t.Fatalf("Read stored sql %q while refresh pending, want prior %q", readSQL.ValueString(), oldSQL.ValueString())
+	}
+
+	// Apply 2: refresh now succeeds and clears the marker.
+	fake.refreshStatus = http.StatusOK
+	diags = nil
+	if !r.updateDataset(ctx, planned, datasetModel("roster", "reporting", readSQL), private, &diags) {
+		t.Fatalf("retry failed: %v", diags)
+	}
+	if got := fake.count("PUT", "/api/v1/dataset/42/refresh"); got != 2 {
+		t.Fatalf("refresh calls = %d, want 2 (failed + retried)", got)
+	}
+	if columnsRefreshPending(ctx, private) {
+		t.Fatal("successful refresh did not clear the pending marker")
+	}
+	if got := datasetSQLFromRead(planned.SQL, newSQL.ValueString(), columnsRefreshPending(ctx, private)); !got.Equal(newSQL) {
+		t.Fatalf("Read after recovery stored %q, want Superset's sql", got.ValueString())
+	}
+}
+
+// Even with no SQL diff in the plan (e.g. only table_name changed), an
+// outstanding refresh is retried.
+func TestDatasetUpdate_PendingRefresh_RetriedWithoutSQLChange(t *testing.T) {
+	ctx := context.Background()
+	sql := types.StringValue("SELECT id, birth_date FROM laborers")
+	private := memPrivate{datasetColumnsRefreshPendingKey: []byte("true")}
+
+	fake, r := newFakeDatasetResource(t, http.StatusOK)
+	var diags diag.Diagnostics
+	if !r.updateDataset(ctx, datasetModel("roster_v2", "reporting", sql), datasetModel("roster", "reporting", sql), private, &diags) {
+		t.Fatalf("update failed: %v", diags)
+	}
+	if got := fake.count("PUT", "/api/v1/dataset/42/refresh"); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1 for a pending refresh", got)
+	}
+	if columnsRefreshPending(ctx, private) {
+		t.Fatal("pending marker not cleared")
+	}
+}
+
+func TestDatasetSQLFromRead(t *testing.T) {
+	prior := types.StringValue("SELECT 1")
+	cases := map[string]struct {
+		remote  interface{}
+		pending bool
+		want    types.String
+	}{
+		"remote sql wins":         {"SELECT 2", false, types.StringValue("SELECT 2")},
+		"pending keeps prior":     {"SELECT 2", true, prior},
+		"remote null keeps prior": {nil, false, prior},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := datasetSQLFromRead(prior, tc.remote, tc.pending); !got.Equal(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
