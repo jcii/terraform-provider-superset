@@ -69,7 +69,7 @@ resource "superset_dashboard" "signups" {
 - `owners` (Set of Number) Identifiers of the users who own the dashboard. Defaults to the user the provider authenticates as.
 - `position_json` (String) JSON document with the layout of the dashboard. The charts referenced by its `CHART` elements are linked to the dashboard. Superset adds the `uuid` of each chart to the layout, which is not reported as drift. When unset, the layout is left to Superset.
 - `published` (Boolean) Whether the dashboard is published; an unpublished dashboard is a draft visible to its owners only. Defaults to `false`.
-- `roles` (Set of Number) Identifiers of the roles granted access to the dashboard when dashboard role-based access control is enabled.
+- `roles` (Set of Number) Identifiers of the roles granted access to the dashboard when dashboard role-based access control is enabled. Unset, the roles Superset holds for the dashboard are kept and shown, such as the roles a server-side hook grants to a new dashboard; set, even to an empty set, they are managed by this resource.
 - `slug` (String) Unique slug used in the URL of the dashboard instead of its id.
 - `tags` (Set of String) Names of the tags attached to the dashboard, with the `TAGGING_SYSTEM` feature flag. When unset, the tags are left as they are; when set, the dashboard has exactly these tags. Tags that do not exist yet are created, and stay when the dashboard is destroyed.
 - `theme_id` (Number) Identifier of the `superset_theme` the dashboard applies, on Superset 6. Unset, the dashboard uses the theme of the instance.

@@ -133,9 +133,15 @@ func (r *dashboardResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				},
 			},
 			"roles": schema.SetAttribute{
-				Description: "Identifiers of the roles granted access to the dashboard when dashboard role-based access control is enabled.",
+				Description: "Identifiers of the roles granted access to the dashboard when dashboard role-based access control is enabled. " +
+					"Unset, the roles Superset holds for the dashboard are kept and shown, such as the roles a server-side hook grants to a new dashboard; " +
+					"set, even to an empty set, they are managed by this resource.",
 				ElementType: types.Int64Type,
 				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.Set{
+					setplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"theme_id": schema.Int64Attribute{
 				Description: "Identifier of the `superset_theme` the dashboard applies, on Superset 6. Unset, the dashboard uses the theme of the instance.",
