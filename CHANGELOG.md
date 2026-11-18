@@ -2,6 +2,7 @@
 
 FEATURES:
 * **Provider**: OIDC client credentials authentication for Superset instances behind an identity provider such as Keycloak: `oidc_token_url`, `client_id` and `client_secret` (or `SUPERSET_OIDC_TOKEN_URL`, `SUPERSET_CLIENT_ID`, `SUPERSET_CLIENT_SECRET`). When `oidc_token_url` is set they replace `username` and `password`, and the identity provider's access token is sent to Superset as a Bearer token. Superset must be configured to verify it. An expired token is replaced on the first 401.
+* **Resource `superset_dashboard`**: `roles` is only sent to Superset when the configuration sets it (an empty set still revokes). Before, every create and update sent an empty list, which removed roles that a Superset hook such as an after_insert tagging listener had granted.
 
 ## 1.2.0 (2026-11-14)
 

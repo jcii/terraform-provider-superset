@@ -45,21 +45,24 @@ type Dashboard struct {
 // null css, metadata or layout, so those are sent as empty strings when empty, which clears them
 // on an update as well. The other nullable fields are sent as null when empty, so an update can
 // clear them. Owners are only sent when set: Superset makes the current user the owner of a
-// dashboard created without owners. Roles are always sent, so an update can revoke them.
+// dashboard created without owners. Roles are only sent when the configuration sets them (an empty
+// set included, which revokes them): a Superset with a role-tagging hook, such as an after_insert
+// listener that grants roles to new dashboards, keeps the roles it set, as sending an empty list
+// on every create and update would remove them.
 type dashboardPayload struct {
-	Title                string  `json:"dashboard_title"`
-	Slug                 *string `json:"slug"`
-	CSS                  string  `json:"css"`
-	Metadata             string  `json:"json_metadata"`
-	Layout               string  `json:"position_json"`
-	Published            bool    `json:"published"`
-	CertifiedBy          *string `json:"certified_by"`
-	CertificationDetails *string `json:"certification_details"`
-	Owners               []int64 `json:"owners,omitempty"`
-	Roles                []int64 `json:"roles"`
-	ThemeID              *int64  `json:"theme_id,omitempty"`
-	IsManagedExternally  bool    `json:"is_managed_externally"`
-	ExternalURL          *string `json:"external_url"`
+	Title                string   `json:"dashboard_title"`
+	Slug                 *string  `json:"slug"`
+	CSS                  string   `json:"css"`
+	Metadata             string   `json:"json_metadata"`
+	Layout               string   `json:"position_json"`
+	Published            bool     `json:"published"`
+	CertifiedBy          *string  `json:"certified_by"`
+	CertificationDetails *string  `json:"certification_details"`
+	Owners               []int64  `json:"owners,omitempty"`
+	Roles                *[]int64 `json:"roles,omitempty"`
+	ThemeID              *int64   `json:"theme_id,omitempty"`
+	IsManagedExternally  bool     `json:"is_managed_externally"`
+	ExternalURL          *string  `json:"external_url"`
 	clearTheme           bool
 }
 
@@ -78,6 +81,10 @@ func (p dashboardPayload) MarshalJSON() ([]byte, error) {
 }
 
 func newDashboardPayload(dashboard Dashboard, metadata string) dashboardPayload {
+	var roles *[]int64
+	if dashboard.Roles != nil {
+		roles = &dashboard.Roles
+	}
 	return dashboardPayload{
 		ThemeID:              dashboard.ThemeID,
 		clearTheme:           dashboard.ClearTheme && dashboard.ThemeID == nil,
@@ -90,7 +97,7 @@ func newDashboardPayload(dashboard Dashboard, metadata string) dashboardPayload 
 		CertifiedBy:          nullIfEmpty(dashboard.CertifiedBy),
 		CertificationDetails: nullIfEmpty(dashboard.CertificationDetails),
 		Owners:               dashboard.Owners,
-		Roles:                nonNil(dashboard.Roles),
+		Roles:                roles,
 		IsManagedExternally:  dashboard.IsManagedExternally,
 		ExternalURL:          nullIfEmpty(dashboard.ExternalURL),
 	}
