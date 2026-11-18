@@ -16,6 +16,8 @@ type testProviderConfig struct {
 	validateCredentials      *bool
 	csrfEnabled              *bool
 	authProvider             *string
+	oidcTokenURL, clientID   *string
+	clientSecret             *string
 }
 
 func strPtr(v string) *string { return &v }
@@ -30,6 +32,9 @@ func configureProvider(t *testing.T, cfg testProviderConfig) *provider.Configure
 	t.Setenv("SUPERSET_HOST", "")
 	t.Setenv("SUPERSET_USERNAME", "")
 	t.Setenv("SUPERSET_PASSWORD", "")
+	t.Setenv("SUPERSET_OIDC_TOKEN_URL", "")
+	t.Setenv("SUPERSET_CLIENT_ID", "")
+	t.Setenv("SUPERSET_CLIENT_SECRET", "")
 	if os.Getenv("SUPERSET_AUTH_PROVIDER") == "" {
 		t.Setenv("SUPERSET_AUTH_PROVIDER", "")
 	}
@@ -59,6 +64,9 @@ func configureProvider(t *testing.T, cfg testProviderConfig) *provider.Configure
 		"validate_credentials": validate,
 		"csrf_enabled":         csrf,
 		"auth_provider":        str(cfg.authProvider),
+		"oidc_token_url":       str(cfg.oidcTokenURL),
+		"client_id":            str(cfg.clientID),
+		"client_secret":        str(cfg.clientSecret),
 	})
 
 	resp := &provider.ConfigureResponse{}
@@ -205,5 +213,36 @@ func TestConfigureAuthProvider(t *testing.T) {
 	}
 	if got := configuredClient(t, resp).AuthProvider; got != "ldap" {
 		t.Fatalf("expected the ldap provider from the environment, got %q", got)
+	}
+}
+
+func TestConfigureWithOIDCUsesClientCredentialsInsteadOfPassword(t *testing.T) {
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+	httpmock.RegisterResponder("POST", "http://idp/token",
+		httpmock.NewStringResponder(200, `{"access_token": "oidc-token"}`))
+
+	resp := configureProvider(t, testProviderConfig{
+		host:         strPtr("http://superset-host"),
+		oidcTokenURL: strPtr("http://idp/token"),
+		clientID:     strPtr("cid"),
+		clientSecret: strPtr("sec"),
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected diagnostics: %v", resp.Diagnostics)
+	}
+	if !configuredClient(t, resp).UsesOIDC() {
+		t.Fatal("expected an OIDC client")
+	}
+}
+
+func TestConfigureWithOIDCRequiresClientSecret(t *testing.T) {
+	resp := configureProvider(t, testProviderConfig{
+		host:         strPtr("http://superset-host"),
+		oidcTokenURL: strPtr("http://idp/token"),
+		clientID:     strPtr("cid"),
+	})
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error for a missing client_secret")
 	}
 }

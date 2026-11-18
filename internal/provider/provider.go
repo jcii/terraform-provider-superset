@@ -44,6 +44,9 @@ type supersetProviderModel struct {
 	ValidateCredentials types.Bool   `tfsdk:"validate_credentials"`
 	CSRFEnabled         types.Bool   `tfsdk:"csrf_enabled"`
 	AuthProvider        types.String `tfsdk:"auth_provider"`
+	OIDCTokenURL        types.String `tfsdk:"oidc_token_url"`
+	ClientID            types.String `tfsdk:"client_id"`
+	ClientSecret        types.String `tfsdk:"client_secret"`
 }
 
 // Metadata returns the provider type name.
@@ -83,6 +86,21 @@ func (p *supersetProvider) Schema(_ context.Context, _ provider.SchemaRequest, r
 					"which is required by a Superset instance with the default `WTF_CSRF_ENABLED = True`. " +
 					"Set it to `false` for an instance where CSRF protection is disabled to skip the extra request before each write operation.",
 				Optional: true,
+			},
+			"oidc_token_url": schema.StringAttribute{
+				Description: "OIDC token endpoint for client credentials authentication, e.g. `https://keycloak.example.com/realms/myrealm/protocol/openid-connect/token`. " +
+					"When set, `client_id` and `client_secret` are used instead of `username` and `password`, and the identity provider's access token is sent to Superset as a Bearer token. " +
+					"Superset must be configured to accept it. Can also be set with the `SUPERSET_OIDC_TOKEN_URL` environment variable.",
+				Optional: true,
+			},
+			"client_id": schema.StringAttribute{
+				Description: "OIDC client ID for client credentials authentication; the client needs service accounts enabled. Can also be set with the `SUPERSET_CLIENT_ID` environment variable.",
+				Optional:    true,
+			},
+			"client_secret": schema.StringAttribute{
+				Description: "OIDC client secret for client credentials authentication. Can also be set with the `SUPERSET_CLIENT_SECRET` environment variable.",
+				Optional:    true,
+				Sensitive:   true,
 			},
 			"auth_provider": schema.StringAttribute{
 				Description: "Authentication provider named in the login request: `db` (the default) for users of the Superset database, " +
@@ -161,6 +179,20 @@ func (p *supersetProvider) Configure(ctx context.Context, req provider.Configure
 		)
 	}
 
+	for _, unknown := range []struct {
+		name  string
+		value types.String
+	}{{"oidc_token_url", config.OIDCTokenURL}, {"client_id", config.ClientID}, {"client_secret", config.ClientSecret}} {
+		if unknown.value.IsUnknown() {
+			resp.Diagnostics.AddAttributeError(
+				path.Root(unknown.name),
+				"Unknown Superset OIDC Setting",
+				"The provider cannot create the Superset API client as there is an unknown configuration value for "+unknown.name+". "+
+					"Either target apply the source of the value first, set the value statically in the configuration, or use the matching SUPERSET_* environment variable.",
+			)
+		}
+	}
+
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -169,6 +201,19 @@ func (p *supersetProvider) Configure(ctx context.Context, req provider.Configure
 	host := os.Getenv("SUPERSET_HOST")
 	username := os.Getenv("SUPERSET_USERNAME")
 	password := os.Getenv("SUPERSET_PASSWORD")
+	oidcTokenURL := os.Getenv("SUPERSET_OIDC_TOKEN_URL")
+	clientID := os.Getenv("SUPERSET_CLIENT_ID")
+	clientSecret := os.Getenv("SUPERSET_CLIENT_SECRET")
+	if !config.OIDCTokenURL.IsNull() {
+		oidcTokenURL = config.OIDCTokenURL.ValueString()
+	}
+	if !config.ClientID.IsNull() {
+		clientID = config.ClientID.ValueString()
+	}
+	if !config.ClientSecret.IsNull() {
+		clientSecret = config.ClientSecret.ValueString()
+	}
+	useOIDC := oidcTokenURL != ""
 	authProvider := os.Getenv("SUPERSET_AUTH_PROVIDER")
 	if !config.AuthProvider.IsNull() {
 		authProvider = config.AuthProvider.ValueString()
@@ -208,7 +253,17 @@ func (p *supersetProvider) Configure(ctx context.Context, req provider.Configure
 		)
 	}
 
-	if validateCredentials && username == "" {
+	if validateCredentials && useOIDC && clientID == "" {
+		resp.Diagnostics.AddAttributeError(path.Root("client_id"), "Missing Superset OIDC Client ID",
+			"oidc_token_url is set, so client_id (or the SUPERSET_CLIENT_ID environment variable) is required.")
+	}
+
+	if validateCredentials && useOIDC && clientSecret == "" {
+		resp.Diagnostics.AddAttributeError(path.Root("client_secret"), "Missing Superset OIDC Client Secret",
+			"oidc_token_url is set, so client_secret (or the SUPERSET_CLIENT_SECRET environment variable) is required.")
+	}
+
+	if validateCredentials && !useOIDC && username == "" {
 		resp.Diagnostics.AddAttributeError(
 			path.Root("username"),
 			"Missing Superset API Username",
@@ -218,7 +273,7 @@ func (p *supersetProvider) Configure(ctx context.Context, req provider.Configure
 		)
 	}
 
-	if validateCredentials && password == "" {
+	if validateCredentials && !useOIDC && password == "" {
 		resp.Diagnostics.AddAttributeError(
 			path.Root("password"),
 			"Missing Superset API Password",
@@ -238,16 +293,24 @@ func (p *supersetProvider) Configure(ctx context.Context, req provider.Configure
 	ctx = tflog.SetField(ctx, "superset_password", password)
 	ctx = tflog.MaskFieldValuesWithFieldKeys(ctx, "superset_username")
 	ctx = tflog.MaskFieldValuesWithFieldKeys(ctx, "superset_password")
+	ctx = tflog.SetField(ctx, "superset_client_secret", clientSecret)
+	ctx = tflog.MaskFieldValuesWithFieldKeys(ctx, "superset_client_secret")
 
 	tflog.Debug(ctx, "Creating Superset client")
 
 	// Create a new Superset client using the configuration values.
 	// The client authenticates lazily, so log in here only when the credentials must be validated.
-	client := client.NewClient(host, username, password)
-	client.CSRFEnabled = config.CSRFEnabled.IsNull() || config.CSRFEnabled.ValueBool()
-	client.AuthProvider = authProvider
+	var supersetClient *client.Client
+	if useOIDC {
+		tflog.Info(ctx, "Using OIDC client credentials authentication")
+		supersetClient = client.NewClientWithOIDC(host, oidcTokenURL, clientID, clientSecret)
+	} else {
+		supersetClient = client.NewClient(host, username, password)
+	}
+	supersetClient.CSRFEnabled = config.CSRFEnabled.IsNull() || config.CSRFEnabled.ValueBool()
+	supersetClient.AuthProvider = authProvider
 	if validateCredentials {
-		if err := client.Authenticate(); err != nil {
+		if err := supersetClient.Authenticate(); err != nil {
 			resp.Diagnostics.AddError(
 				"Unable to Create Superset API Client",
 				"An unexpected error occurred when creating the Superset API client. "+
@@ -261,8 +324,8 @@ func (p *supersetProvider) Configure(ctx context.Context, req provider.Configure
 	}
 
 	// Make the Superset client available during DataSource and Resource type Configure methods.
-	resp.DataSourceData = client
-	resp.ResourceData = client
+	resp.DataSourceData = supersetClient
+	resp.ResourceData = supersetClient
 
 	tflog.Info(ctx, "Configured Superset client", map[string]any{"success": true})
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,6 +89,13 @@ type Client struct {
 	// AuthProvider is the authentication provider named in the login request, "db" (the default) or "ldap".
 	AuthProvider string
 
+	// OIDC client credentials authentication, used instead of Username/Password when OIDCTokenURL is set.
+	// The identity provider's access token is sent to Superset as a Bearer token, so Superset must
+	// accept and verify it (e.g. a custom security manager validating the token against the IdP's JWKS).
+	OIDCTokenURL string
+	ClientID     string
+	ClientSecret string
+
 	mu    sync.Mutex
 	token string
 
@@ -110,6 +118,24 @@ func NewClient(host, username, password string) *Client {
 		Password:    password,
 		CSRFEnabled: true,
 	}
+}
+
+// NewClientWithOIDC creates a Superset client that authenticates with the OIDC client credentials grant
+// (for OAuth/Keycloak setups) instead of a Superset username and password.
+// Like NewClient it does not send any request until the first API call or Authenticate.
+func NewClientWithOIDC(host, oidcTokenURL, clientID, clientSecret string) *Client {
+	return &Client{
+		Host:         host,
+		OIDCTokenURL: oidcTokenURL,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		CSRFEnabled:  true,
+	}
+}
+
+// UsesOIDC reports whether the client authenticates with OIDC client credentials.
+func (c *Client) UsesOIDC() bool {
+	return c.OIDCTokenURL != ""
 }
 
 // authProvider returns the authentication provider of the login, "db" unless another one is set.
@@ -161,11 +187,20 @@ func (c *Client) validateSettings() error {
 	if c.Host == "" {
 		missing = append(missing, "host (SUPERSET_HOST)")
 	}
-	if c.Username == "" {
-		missing = append(missing, "username (SUPERSET_USERNAME)")
-	}
-	if c.Password == "" {
-		missing = append(missing, "password (SUPERSET_PASSWORD)")
+	if c.UsesOIDC() {
+		if c.ClientID == "" {
+			missing = append(missing, "client_id (SUPERSET_CLIENT_ID)")
+		}
+		if c.ClientSecret == "" {
+			missing = append(missing, "client_secret (SUPERSET_CLIENT_SECRET)")
+		}
+	} else {
+		if c.Username == "" {
+			missing = append(missing, "username (SUPERSET_USERNAME)")
+		}
+		if c.Password == "" {
+			missing = append(missing, "password (SUPERSET_PASSWORD)")
+		}
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("superset provider is not configured, missing: %s", strings.Join(missing, ", "))
@@ -178,6 +213,9 @@ func (c *Client) validateSettings() error {
 func (c *Client) login() error {
 	if err := c.validateSettings(); err != nil {
 		return err
+	}
+	if c.UsesOIDC() {
+		return c.loginOIDC()
 	}
 
 	url := fmt.Sprintf("%s/api/v1/security/login", c.Host)
@@ -224,6 +262,51 @@ func (c *Client) login() error {
 	}
 
 	c.token = token
+	return nil
+}
+
+// loginOIDC obtains an access token from the OIDC token endpoint with the client credentials grant
+// and stores it as the access token. The caller must hold c.mu.
+// An expired token needs no tracking here: Superset answers 401 and send logs in again.
+func (c *Client) loginOIDC() error {
+	form := url.Values{}
+	form.Set("grant_type", "client_credentials")
+	form.Set("client_id", c.ClientID)
+	form.Set("client_secret", c.ClientSecret)
+	encoded := form.Encode()
+
+	resp, err := doWithRetry(func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", c.OIDCTokenURL, strings.NewReader(encoded))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req, nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to request OIDC token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read OIDC token response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return responseError("obtain an OIDC token", resp, body)
+	}
+
+	var result struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to parse OIDC token response: %w", err)
+	}
+	if result.AccessToken == "" {
+		return fmt.Errorf("OIDC token response did not contain an access_token")
+	}
+
+	c.token = result.AccessToken
 	return nil
 }
 

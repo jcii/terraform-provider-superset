@@ -81,6 +81,9 @@ func TestReadOfAMissingObjectRemovesTheResource(t *testing.T) {
 		"validate_credentials": tftypes.NewValue(tftypes.Bool, true),
 		"csrf_enabled":         tftypes.NewValue(tftypes.Bool, true),
 		"auth_provider":        tftypes.NewValue(tftypes.String, nil),
+		"oidc_token_url":       tftypes.NewValue(tftypes.String, nil),
+		"client_id":            tftypes.NewValue(tftypes.String, nil),
+		"client_secret":        tftypes.NewValue(tftypes.String, nil),
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -173,6 +176,9 @@ func TestDeleteOfAMissingObjectSucceeds(t *testing.T) {
 		"validate_credentials": tftypes.NewValue(tftypes.Bool, true),
 		"csrf_enabled":         tftypes.NewValue(tftypes.Bool, true),
 		"auth_provider":        tftypes.NewValue(tftypes.String, nil),
+		"oidc_token_url":       tftypes.NewValue(tftypes.String, nil),
+		"client_id":            tftypes.NewValue(tftypes.String, nil),
+		"client_secret":        tftypes.NewValue(tftypes.String, nil),
 	}))
 	if err != nil {
 		t.Fatal(err)

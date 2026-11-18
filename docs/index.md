@@ -125,6 +125,9 @@ With `csrf_enabled = false` write requests to a Superset instance that enforces 
 
 ### Optional
 
+- `oidc_token_url` (String) OIDC token endpoint for client credentials authentication. When set, `client_id` and `client_secret` are used instead of `username` and `password`, and the identity provider's access token is sent to Superset as a Bearer token. Superset must be configured to accept it. Can also be set with the `SUPERSET_OIDC_TOKEN_URL` environment variable.
+- `client_id` (String) OIDC client ID for client credentials authentication; the client needs service accounts enabled. Can also be set with the `SUPERSET_CLIENT_ID` environment variable.
+- `client_secret` (String, Sensitive) OIDC client secret for client credentials authentication. Can also be set with the `SUPERSET_CLIENT_SECRET` environment variable.
 - `auth_provider` (String) Authentication provider named in the login request: `db` (the default) for users of the Superset database, `ldap` for an instance with `AUTH_TYPE = AUTH_LDAP`. Can also be set with the `SUPERSET_AUTH_PROVIDER` environment variable.
 - `csrf_enabled` (Boolean) Whether to request a CSRF token from Superset and send it with every write request. Defaults to `true`, which is required by a Superset instance with the default `WTF_CSRF_ENABLED = True`. Set it to `false` for an instance where CSRF protection is disabled to skip the extra request before each write operation.
 - `host` (String) The URL of the Superset instance. This should include the protocol (http or https) and the hostname or IP address. Example: 'https://superset.example.com'.
