@@ -16,6 +16,10 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    env:
+      # This fork signs the checksums only when a GPG key is configured as a repository secret;
+      # without one the release is still built and checksummed, just not signed.
+      HAS_GPG: ${{ secrets.GPG_PRIVATE_KEY != '' }}
     steps:
       - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
         with:
@@ -26,6 +30,7 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
       - name: Import GPG key
+        if: env.HAS_GPG == 'true'
         uses: crazy-max/ghaction-import-gpg@01dd5d3ca463c7f10f7f4f7b4f177225ac661ee4 # v6.1.0
         id: import_gpg
         with:
@@ -34,7 +39,7 @@ jobs:
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@7ec5c2b0c6cdda6e8bbb49444bc797dd33d74dd8 # v5.0.0
         with:
-          args: release --clean
+          args: ${{ env.HAS_GPG == 'true' && 'release --clean' || 'release --clean --skip=sign' }}
         env:
           # GitHub sets the GITHUB_TOKEN secret automatically.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

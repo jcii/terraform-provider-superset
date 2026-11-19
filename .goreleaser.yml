@@ -52,6 +52,8 @@ signs:
       - "--detach-sign"
       - "${artifact}"
 release:
+  # A tag such as v1.2.0-oidc.4 is a prerelease, so it must not become the "Latest" release.
+  prerelease: auto
   extra_files:
     - glob: 'terraform-registry-manifest.json'
       name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
